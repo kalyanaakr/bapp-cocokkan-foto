@@ -71,12 +71,21 @@ def save_table(key):
             row=updated[int(index)]
             for label,field in mapping.items():
                 if label in delta:row[field]=str(delta[label] or '')
-            if 'Benar' in delta:row['uncertain']=not bool(delta['Benar'])
-            if any(k in delta for k in mapping):row['uncertain']=True
+        deleted={int(i) for i in changes.get('deleted_rows',[])}
+        updated=[r for i,r in enumerate(updated) if i not in deleted]
+        for delta in changes.get('added_rows',[]):
+            row={field:str(delta.get(label) or '') for label,field in mapping.items()}
+            if any(row.values()):updated.append(dict(row,source='Manual',uncertain=False))
         st.session_state.draft_rows=vision.clean_rows(updated)
         st.session_state.draft_version+=1
         st.session_state.pop('comparison',None)
-    except (ValueError,IndexError):pass
+        st.session_state.pop('draft_edit_error',None)
+    except (ValueError,IndexError) as e:
+        st.session_state.draft_edit_error='Koreksi belum tersimpan: '+str(e)
+
+def comparison_rows(rows):
+    # No manual confirmation gate: compare extracted identifiers directly.
+    return [dict(r,uncertain=False) for r in vision.clean_rows(rows)]
 
 def decode_backup(raw):
     if len(raw)>2_000_000:raise ValueError()
@@ -224,32 +233,14 @@ with st.expander('Foto yang sudah masuk draft'):
         if entries[idx].get('preview'):st.image(entries[idx]['preview'],width='stretch')
         else:st.caption('Pratinjau foto tidak disertakan dalam file cadangan draft.')
     else:st.caption('Belum ada foto. Kamu juga bisa menambah baris manual.')
-view=st.radio('Tampilan pemeriksaan',['Kartu — nyaman di HP','Tabel — layar lebar'],horizontal=True)
-st.caption('Periksa ID dan NPSN, lalu tandai Benar. Identitas yang berulang tetap terlihat dan tidak dihitung ganda saat pencocokan.')
+view='Tabel'
+st.caption('Edit langsung sel yang salah. Tidak perlu centang validasi per baris. Di HP, geser tabel ke samping untuk kolom lainnya.')
 if st.session_state.draft_rows:
-    if view.startswith('Kartu'):
-        idx=st.selectbox('Pilih baris untuk diperiksa',range(len(st.session_state.draft_rows)),format_func=lambda i:f"{i+1}. {st.session_state.draft_rows[i]['id_transaksi'] or 'ID belum terbaca'} · {st.session_state.draft_rows[i]['nama_sekolah']}")
-        r=st.session_state.draft_rows[idx]
-        st.caption(r['source'])
-        with st.form('row_'+str(st.session_state.draft_version)+'_'+str(idx)):
-            tx=st.text_input('ID transaksi',value=r['id_transaksi'],max_chars=80)
-            npsn=st.text_input('NPSN',value=r['npsn'],max_chars=30)
-            school=st.text_input('Nama sekolah',value=r['nama_sekolah'],max_chars=250)
-            correct=st.checkbox('Identitas ini sudah saya periksa',value=not r['uncertain'])
-            save=st.form_submit_button('Simpan koreksi',type='primary',width='stretch')
-            delete=st.form_submit_button('Hapus baris ini',width='stretch')
-        if save or delete:
-            try:
-                if delete:st.session_state.draft_rows.pop(idx)
-                else:st.session_state.draft_rows[idx]=vision.clean_rows([dict(id_transaksi=tx,npsn=npsn,nama_sekolah=school,source=r['source'],uncertain=not correct)])[0]
-                st.session_state.draft_version+=1;st.session_state.pop('comparison',None);st.rerun()
-            except ValueError as e:safe_error(e)
-        st.caption('Tekan Simpan koreksi sebelum berpindah baris atau menambah foto.')
-    else:
-        key='draft_editor_'+str(st.session_state.draft_version)
-        frame=pd.DataFrame([{'Benar':not r['uncertain'],'ID transaksi':r['id_transaksi'],'NPSN':r['npsn'],'Nama sekolah':r['nama_sekolah'],'Sumber':r['source']} for r in st.session_state.draft_rows])
-        st.data_editor(frame,hide_index=True,width='stretch',key=key,on_change=save_table,args=(key,),disabled=['Sumber'],column_config={'Benar':st.column_config.CheckboxColumn('Benar'),'NPSN':st.column_config.TextColumn('NPSN')})
-        st.caption('Koreksi tabel tersimpan setelah sel selesai diedit. Jika ID/NPSN diubah, konfirmasi Benar kembali.')
+    key='draft_editor_'+str(st.session_state.draft_version)
+    frame=pd.DataFrame([{'ID transaksi':r['id_transaksi'],'NPSN':r['npsn'],'Nama sekolah':r['nama_sekolah'],'Sumber':r['source']} for r in st.session_state.draft_rows])
+    st.data_editor(frame,hide_index=False,width='stretch',num_rows='dynamic',key=key,on_change=save_table,args=(key,),disabled=['Sumber'],column_config={'NPSN':st.column_config.TextColumn('NPSN'),'ID transaksi':st.column_config.TextColumn('ID transaksi')})
+    st.caption('Perubahan tersimpan setelah keluar dari sel. Pilih baris untuk menghapusnya, atau isi baris paling bawah untuk menambah.')
+if st.session_state.get('draft_edit_error'):st.error(st.session_state.draft_edit_error)
 with st.expander('Tambah baris manual'):
     with st.form('manual_draft'):
         tx=st.text_input('ID transaksi baru',max_chars=80)
@@ -278,7 +269,7 @@ with st.expander('Mulai draft baru'):
     reset=st.checkbox('Saya sudah menyimpan hasil/cadangan yang diperlukan')
     if st.button('Kosongkan draft',disabled=not reset):
         st.session_state.draft_rows=[];st.session_state.draft_photos={};st.session_state.ocr_cache={};st.session_state.draft_version+=1;st.session_state.pop('comparison',None);st.rerun()
-rows=st.session_state.draft_rows
+rows=comparison_rows(st.session_state.draft_rows)
 signature=hashlib.sha256(json.dumps([sorted(fids),rows],sort_keys=True).encode()).hexdigest()
 if st.session_state.get('comp_sig')!=signature:st.session_state.pop('comparison',None)
 if st.button('Cocokkan seluruh draft',type='primary',width='stretch',disabled=not rows):
@@ -289,6 +280,7 @@ if st.button('Cocokkan seluruh draft',type='primary',width='stretch',disabled=no
 comparison=st.session_state.get('comparison')
 if comparison:
     st.divider();st.subheader('Hasil pencocokan')
+    st.caption('Hasil berdasarkan ID bacaan foto, bukan bukti validasi manual. ID kosong atau NPSN berbeda tetap ditandai untuk diperiksa.')
     labels={'OUTSIDE':'Di luar semua bundle pilihan','MATCH':'Cocok','REVIEW':'Perlu diperiksa','NOT_FOUND':'Tidak ada di master','DUPLICATE':'Duplikat'}
     for code,label in labels.items():st.write(f"**{label}:** {comparison['counts'][code]}")
     for w in comparison['bundle']['warnings']:st.warning(w)
