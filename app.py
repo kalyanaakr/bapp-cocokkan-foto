@@ -3,6 +3,52 @@ import pandas as pd
 import streamlit as st
 import httpx
 import bapp_client,vision
+def classify(rows,master,members):
+    by_id={r['id_transaksi']:r for r in master}
+    by_npsn={}
+    for item in master:by_npsn.setdefault(item.get('npsn'),[]).append(item)
+    member_ids={r['id_transaksi'] for r in members}
+    seen=set();matched=set();result=[]
+    for item in vision.clean_rows(rows):
+        tx=item['id_transaksi'];found=by_id.get(tx);reason='';status='REVIEW'
+        if item['uncertain']:reason='Bacaan belum dikonfirmasi.'
+        elif not tx:reason='ID transaksi kosong. Cocokkan kandidat NPSN terlebih dahulu.'
+        elif not found:reason='ID belum ditemukan di Data Master.';status='NOT_FOUND'
+        elif item['npsn'] and item['npsn']!=str(found.get('npsn') or ''):reason='ID cocok tetapi NPSN berbeda.'
+        elif tx in seen:status='DUPLICATE';reason='ID muncul lebih dari sekali; tidak dihitung ulang.'
+        else:
+            seen.add(tx)
+            if tx in member_ids:status='MATCH';matched.add(tx)
+            else:status='OUTSIDE'
+        candidates=by_npsn.get(item['npsn'],[]) if item['npsn'] else []
+        result.append(dict(item,status=status,note=reason,master=found,candidates=candidates[:5]))
+    missing=[r for r in members if r['id_transaksi'] not in matched]
+    order={'OUTSIDE':0,'REVIEW':1,'NOT_FOUND':2,'DUPLICATE':3,'MATCH':4}
+    result.sort(key=lambda r:order[r['status']])
+    return dict(rows=result,unseen=missing,counts={k:sum(r['status']==k for r in result) for k in order})
+
+def combine_snapshots(snapshots):
+    members={};membership={};warnings=[]
+    for snapshot in snapshots:
+        h=snapshot['header'];label=str(h['nomor_folder'])+' ['+str(h['id_bapp_folder'])+']'
+        warnings.extend(label+': '+w for w in snapshot['warnings'])
+        for row in snapshot['members']:
+            tx=row['id_transaksi'];members.setdefault(tx,dict(row));membership.setdefault(tx,[])
+            if label not in membership[tx]:membership[tx].append(label)
+    for tx,row in members.items():row['Bundle pilihan']=', '.join(membership[tx])
+    return dict(members=list(members.values()),warnings=warnings,membership=membership)
+
+def compare_many(fids,rows):
+    # First response supplies master identities for ALL input rows, regardless of membership.
+    first=api('compare',fid=fids[0],rows=rows)
+    snapshots=[first['bundle']]+[api('bundle',fid=fid) for fid in fids[1:]]
+    combined=combine_snapshots(snapshots);master={}
+    for row in first['rows']:
+        for m in ([row['master']] if row.get('master') else [])+row.get('candidates',[]):master[m['id_transaksi']]=m
+    result=classify(rows,list(master.values()),combined['members'])
+    for row in result['rows']:row['selected_bundles']=', '.join(combined['membership'].get(row['id_transaksi'],[]))
+    return dict(result,bundle=combined)
+
 st.set_page_config(page_title='Cocokkan BAPP',page_icon='📋',layout='wide')
 def secret(k):
     try:return str(st.secrets.get(k,''))
@@ -65,19 +111,27 @@ with st.container(border=True):
     if search:
         try:st.session_state.search=api('folders',q=q,directorate='' if directorate=='Semua' else directorate)
         except (ValueError,httpx.HTTPError) as e:safe_error(e)
-    result=st.session_state.get('search',{'rows':[]});by_id={r['id_bapp_folder']:r for r in result['rows']}
-    if result.get('more'):st.caption('Menampilkan 50 hasil. Perjelas nomor atau direktorat untuk hasil lainnya.')
-    fid=st.selectbox('Pilih bundle',list(by_id),index=None,format_func=lambda k:' · '.join(str(by_id[k].get(x) or '—') for x in ('nomor_folder','direktorat','koordinator','batch'))+' · '+k)
-    if search and not by_id:st.info('Bundle tidak ditemukan.')
-if not fid:st.info('Pilih bundle untuk mulai mencocokkan.');st.stop()
-if st.session_state.get('fid')!=fid:
+    result=st.session_state.get('search',{'rows':[]})
+    catalog=st.session_state.setdefault('bundle_catalog',{})
+    for row in result['rows']:catalog[row['id_bapp_folder']]=row
+    if result.get('more'):st.caption('50 hasil pencarian ditambahkan. Perjelas nomor untuk menemukan bundle lain; pilihan sebelumnya tetap tersimpan.')
+    def bundle_label(k):
+        r=catalog[k]
+        return ' · '.join(str(r.get(x) or '—') for x in ('nomor_folder','direktorat','koordinator','batch'))+' · '+k
+    fids=st.multiselect('Bundle yang dibandingkan',list(catalog),format_func=bundle_label,key='selected_bundle_ids',max_selections=10,placeholder='Pilih satu atau beberapa bundle')
+    st.caption('Cari nomor lain untuk menambah pilihan. Klik × pada bundle untuk menghapusnya. Maksimal 10 bundle per pencocokan.')
+    if search and not result['rows']:st.info('Tidak ada hasil baru. Pilihan bundle sebelumnya tetap tersedia.')
+if not fids:st.info('Pilih sedikitnya satu bundle untuk mulai mencocokkan.');st.stop()
+if st.session_state.get('snapshot_ids')!=fids:
     try:
-        st.session_state.snapshot=api('bundle',fid=fid);st.session_state.fid=fid;st.session_state.pop('comparison',None)
+        with st.spinner('Membaca anggota bundle pilihan…'):
+            snapshot=combine_snapshots([api('bundle',fid=f) for f in fids])
+        st.session_state.snapshot=snapshot;st.session_state.snapshot_ids=list(fids);st.session_state.pop('comparison',None)
     except (ValueError,httpx.HTTPError) as e:safe_error(e);st.stop()
 snapshot=st.session_state.snapshot
-st.caption(f"{snapshot['header']['nomor_folder']} · {len(snapshot['members'])} baris anggota di database")
+st.caption(f"{len(fids)} bundle dipilih · {len(snapshot['members'])} ID transaksi unik di database")
 for warning in snapshot['warnings']:st.warning(warning)
-with st.expander('Lihat anggota bundle'):st.dataframe(pd.DataFrame(snapshot['members']),hide_index=True,width='stretch')
+with st.expander('Lihat gabungan anggota bundle'):st.dataframe(pd.DataFrame(snapshot['members']),hide_index=True,width='stretch')
 photos=st.file_uploader('Foto daftar BAPP',type=['jpg','jpeg','png','webp'],accept_multiple_files=True)
 if len(photos)>5 or any(p.size>4*1024*1024 for p in photos):st.error('Maksimal 5 foto, masing-masing 4 MB.');st.stop()
 sig=hashlib.sha256(b''.join(p.name.encode()+p.getvalue() for p in photos)).hexdigest()
@@ -112,22 +166,24 @@ with right:
     frame=frame.astype({'Benar':'bool','ID transaksi':'string','NPSN':'string','Nama sekolah':'string','Sumber':'string'})
     edit=st.data_editor(frame,num_rows='dynamic',hide_index=True,width='stretch',key='editor_'+str(st.session_state.version),column_config={'Benar':st.column_config.CheckboxColumn('Benar',default=False),'NPSN':st.column_config.TextColumn('NPSN'),'ID transaksi':st.column_config.TextColumn('ID transaksi')})
     rows=[{'uncertain':not bool(r['Benar']),'id_transaksi':r['ID transaksi'],'npsn':r['NPSN'],'nama_sekolah':r['Nama sekolah'],'source':r['Sumber']} for r in edit.fillna({'Benar':False,'ID transaksi':'','NPSN':'','Nama sekolah':'','Sumber':''}).to_dict('records')]
-    signature=hashlib.sha256(json.dumps([fid,sig,rows],sort_keys=True).encode()).hexdigest()
+    signature=hashlib.sha256(json.dumps([sorted(fids),sig,rows],sort_keys=True).encode()).hexdigest()
     if st.session_state.get('comp_sig')!=signature:st.session_state.pop('comparison',None)
     if st.button('Cocokkan dengan BAPP',type='primary',disabled=not rows):
         try:
-            st.session_state.comparison=api('compare',fid=fid,rows=rows);st.session_state.comp_sig=signature
+            with st.spinner('Mencocokkan seluruh bundle pilihan…'):
+                result=compare_many(fids,rows)
+            st.session_state.comparison=result;st.session_state.comp_sig=signature
         except (ValueError,httpx.HTTPError) as e:safe_error(e)
 comparison=st.session_state.get('comparison')
 if comparison:
     st.divider();st.subheader('Hasil pencocokan')
-    labels={'OUTSIDE':'Di foto, di luar bundle','MATCH':'Cocok','REVIEW':'Perlu diperiksa','NOT_FOUND':'Tidak ada di master','DUPLICATE':'Duplikat'}
+    labels={'OUTSIDE':'Di luar semua bundle pilihan','MATCH':'Cocok','REVIEW':'Perlu diperiksa','NOT_FOUND':'Tidak ada di master','DUPLICATE':'Duplikat'}
     for col,(code,label) in zip(st.columns(5),labels.items()):col.metric(label,comparison['counts'][code])
     for w in comparison['bundle']['warnings']:st.warning(w)
     table=[]
     for r in comparison['rows']:
         master=r.get('master') or {}
-        table.append({'Status':labels[r['status']],'ID transaksi':r['id_transaksi'],'NPSN':r['npsn'],'Sekolah':master.get('nama_sekolah') or r['nama_sekolah'],'Bundle di master':master.get('bundles') or '', 'Foto':r['source'],'Catatan':r['note'],'Kandidat NPSN':', '.join(x['id_transaksi'] for x in r['candidates'])})
+        table.append({'Status':labels[r['status']],'ID transaksi':r['id_transaksi'],'NPSN':r['npsn'],'Sekolah':master.get('nama_sekolah') or r['nama_sekolah'],'Cocok di bundle pilihan':r['selected_bundles'],'Bundle di master':master.get('bundles') or '', 'Foto':r['source'],'Catatan':r['note'],'Kandidat NPSN':', '.join(x['id_transaksi'] for x in r['candidates'])})
     selected=st.selectbox('Tampilkan hasil',['Semua',*labels.values()])
     st.dataframe(pd.DataFrame([r for r in table if selected=='Semua' or r['Status']==selected]),hide_index=True,width='stretch')
     with st.expander('Anggota bundle yang belum teridentifikasi di foto'):
