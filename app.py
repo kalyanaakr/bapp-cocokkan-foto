@@ -49,6 +49,18 @@ def compare_many(fids,rows):
     for row in result['rows']:row['selected_bundles']=', '.join(combined['membership'].get(row['id_transaksi'],[]))
     return dict(result,bundle=combined)
 
+
+def load_catalog(directorate):
+    all_rows={};cursor='';seen=set()
+    for _ in range(100):
+        page=api('catalog',directorate=directorate,cursor=cursor)
+        for row in page['rows']:all_rows[row['id_bapp_folder']]=row
+        next_cursor=page.get('next_cursor')
+        if not next_cursor:return all_rows
+        if next_cursor in seen or not page['rows']:raise ValueError('Daftar bundle belum lengkap. Coba muat ulang.')
+        seen.add(next_cursor);cursor=next_cursor
+    raise ValueError('Daftar bundle terlalu besar. Pilih direktorat yang lebih spesifik.')
+
 st.set_page_config(page_title='Cocokkan BAPP',page_icon='📋',layout='wide')
 def secret(k):
     try:return str(st.secrets.get(k,''))
@@ -103,24 +115,33 @@ with st.sidebar:
 st.title('Cocokkan foto dengan bundle')
 st.write('Temukan BAPP yang terlihat di foto tetapi belum tercatat dalam bundle pilihanmu.')
 with st.container(border=True):
-    with st.form('bundle_search_form'):
-        c1,c2,c3=st.columns([1,3,1])
-        directorate=c1.selectbox('Direktorat',['Semua','PAUD','SD','SMP','SMA','SMK','PKPLK','PNFI'])
-        q=c2.text_input('Nomor penerimaan / bundle',placeholder='Contoh: BAPP-RCV-SMP-0234',max_chars=100)
-        search=c3.form_submit_button('Cari bundle',type='primary')
-    if search:
-        try:st.session_state.search=api('folders',q=q,directorate='' if directorate=='Semua' else directorate)
-        except (ValueError,httpx.HTTPError) as e:safe_error(e)
-    result=st.session_state.get('search',{'rows':[]})
+    c1,c2=st.columns([4,1])
+    directorate=c1.selectbox('Direktorat',['Semua','PAUD','SD','SMP','SMA','SMK','PKPLK','PNFI'])
+    refresh=c2.button('Muat ulang daftar',help='Ambil daftar terbaru setelah sinkronisasi BAPP.')
+    d='' if directorate=='Semua' else directorate
+    credential_id=hashlib.sha256((secret('BAPP_URL')+secret('BAPP_BRIDGE_TOKEN')).encode()).hexdigest()
+    if st.session_state.get('catalog_credentials')!=credential_id:
+        st.session_state.catalog_pages={};st.session_state.bundle_catalog={};st.session_state.selected_bundle_ids=[]
+        st.session_state.catalog_credentials=credential_id
+    pages=st.session_state.setdefault('catalog_pages',{})
+    if refresh:pages.pop(d,None)
+    if d not in pages or time.time()-pages[d]['at']>300:
+        try:
+            with st.spinner('Memuat daftar bundle…'):
+                loaded=load_catalog(d)
+            pages[d]={'rows':loaded,'at':time.time()}
+        except (ValueError,httpx.HTTPError) as e:
+            safe_error(e);st.info('Jika bridge belum diperbarui, pasang bapp_patch_dropdown_bundle.py di Ubuntu terlebih dahulu.');st.stop()
+    available=pages[d]['rows']
     catalog=st.session_state.setdefault('bundle_catalog',{})
-    for row in result['rows']:catalog[row['id_bapp_folder']]=row
-    if result.get('more'):st.caption('50 hasil pencarian ditambahkan. Perjelas nomor untuk menemukan bundle lain; pilihan sebelumnya tetap tersimpan.')
+    catalog.update(available)
+    previous=st.session_state.get('selected_bundle_ids',[])
+    options=sorted(set(available)|{k for k in previous if k in catalog},key=lambda k:(str(catalog[k].get('nomor_folder') or ''),k))
     def bundle_label(k):
         r=catalog[k]
-        return ' · '.join(str(r.get(x) or '—') for x in ('nomor_folder','direktorat','koordinator','batch'))+' · '+k
-    fids=st.multiselect('Bundle yang dibandingkan',list(catalog),format_func=bundle_label,key='selected_bundle_ids',max_selections=10,placeholder='Pilih satu atau beberapa bundle')
-    st.caption('Cari nomor lain untuk menambah pilihan. Klik × pada bundle untuk menghapusnya. Maksimal 10 bundle per pencocokan.')
-    if search and not result['rows']:st.info('Tidak ada hasil baru. Pilihan bundle sebelumnya tetap tersedia.')
+        return ' · '.join(str(r.get(x) or '—') for x in ('nomor_folder','direktorat','koordinator'))+' · Batch '+str(r.get('batch') or '—')+' · '+k
+    fids=st.multiselect('Pilih bundle — ketik nomor langsung di sini',options,format_func=bundle_label,key='selected_bundle_ids',max_selections=10,placeholder='Ketik contoh: 0434, lalu pilih bundle')
+    st.caption(f"{len(available):,} bundle tersedia untuk filter ini. Pilih maksimal 10 bundle. Pilihan sebelumnya tetap tersimpan saat direktorat diganti.")
 if not fids:st.info('Pilih sedikitnya satu bundle untuk mulai mencocokkan.');st.stop()
 if st.session_state.get('snapshot_ids')!=fids:
     try:
